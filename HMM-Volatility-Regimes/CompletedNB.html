@@ -1,1527 +1,423 @@
-# 📦 Imports
-import yfinance as yf
+# =========================
+# Imports
+# =========================
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
 import seaborn as sns
+import yfinance as yf
+from hmmlearn.hmm import GaussianHMM
+from tqdm import tqdm
+from sklearn.linear_model import LinearRegression
 
-# ✅ Étape 1 - Récupération des données
+# =========================
+# 1) Data
+# =========================
+# S&P 500 (change ticker/dates if needed)
 data = yf.download('^GSPC', start='2000-01-01', end='2025-04-01')
-
-# ✅ Étape 2 - Calcul des log-returns
 data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-data = data.dropna()
-
-# ✅ Étape 3 - Préparation des données pour le modèle
+data.dropna(inplace=True)
 returns = data['Log_Returns'].values.reshape(-1, 1)
 
-# ✅ Étape 4 - HMM à 3 états
-model = GaussianHMM(n_components=3, covariance_type='full', n_iter=1000)
+# =========================
+# 2) Static 3-state HMM
+# =========================
+# Fit HMM
+model = GaussianHMM(n_components=3, covariance_type='full', n_iter=1000, random_state=42)
 model.fit(returns)
 
-# ✅ Étape 5 - Prédiction des états cachés
+# Viterbi states
 hidden_states = model.predict(returns)
 
-# ✅ Étape 5 bis - Reclasser les régimes par ordre de volatilité
+# Reorder states by volatility (low→high)
 state_variances = [np.var(returns[hidden_states == i]) for i in range(3)]
-sorted_states = np.argsort(state_variances)  # indices des régimes triés
+sorted_states = np.argsort(state_variances)
 remap = {old: new for new, old in enumerate(sorted_states)}
 remapped_states = np.vectorize(remap.get)(hidden_states)
 data['Hidden_State'] = remapped_states
 
-# ✅ Étape 6 - Visualisation des régimes
-colors = ['green', 'orange', 'red']  # 0 = calme, 2 = crise
+# =========================
+# 3) Regime scatter
+# =========================
+colors = ['green', 'orange', 'red']  # 0=calm, 2=crisis
 plt.figure(figsize=(15, 7))
 for i in range(3):
-    state = (data['Hidden_State'] == i)
-    plt.plot(data.index[state], data['Log_Returns'][state], '.', label=f"Régime {i}", color=colors[i], alpha=0.6)
-
-plt.title("Régimes de marché détectés par un HMM à 3 états sur le S&P 500")
+    mask = data['Hidden_State'] == i
+    plt.plot(data.index[mask], data['Log_Returns'][mask], '.', label=f"Regime {i}", color=colors[i], alpha=0.6)
+plt.title("3-State HMM Regimes on S&P 500")
 plt.xlabel("Date")
-plt.ylabel("Log-returns")
+plt.ylabel("Log Returns")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-# ✅ Étape 7 - Statistiques de chaque régime
-print("Statistiques par régime détecté (classés par volatilité croissante) :\n")
+# =========================
+# 4) Regime stats
+# =========================
+print("Regime stats (sorted by volatility):")
 for i in range(3):
-    mask = (data['Hidden_State'] == i)
-    mean = data['Log_Returns'][mask].mean()
-    var = data['Log_Returns'][mask].var()
-    print(f"Régime {i} : Moyenne = {mean:.5f}, Variance = {var:.5f}")
+    sub = data.loc[data['Hidden_State'] == i, 'Log_Returns']
+    print(f"Regime {i}: mean={sub.mean():.5f}, var={sub.var():.5f}")
 
-# ✅ Volatilité implicite estimée
-data['Variance_estimee'] = [model.covars_[hidden_states[i]][0][0] for i in range(len(hidden_states))]
+# =========================
+# 5) Implied vol estimate from HMM (per-time covariance)
+# =========================
+# Note: HMM covariances are state-level; we map the active state's var to each day.
+state_var_sequence = np.array([model.covars_[sorted_states == sorted_states[remap[s]]][0][0][0] 
+                               if model.covars_.ndim == 3 else model.covars_[remap[s]][0]
+                               for s in hidden_states])
+data['HMM_Var'] = state_var_sequence
 plt.figure(figsize=(14, 5))
-plt.plot(data.index, np.sqrt(data['Variance_estimee']) * np.sqrt(252))  # Annualisée
-plt.title("Volatilité implicite estimée par le HMM")
-plt.ylabel("Volatilité (annualisée)")
+plt.plot(data.index, np.sqrt(data['HMM_Var']) * np.sqrt(252))
+plt.title("HMM-Implied Volatility (Annualized)")
+plt.ylabel("Volatility")
 plt.xlabel("Date")
 plt.grid(True)
+plt.tight_layout()
 plt.show()
 
-# ✅ Bande verticale colorée
+# =========================
+# 6) Vertical color bands by regime (visual context)
+# =========================
 fig, ax = plt.subplots(figsize=(14, 6))
-ax.plot(data.index, data['Log_Returns'], color='black', lw=0.5, label="Log-returns")
-colors_map = {0: 'green', 1: 'orange', 2: 'red'}
-hidden_colors = data['Hidden_State'].map(colors_map)
-for i in range(len(data)):
-    ax.axvline(data.index[i], color=hidden_colors[i], alpha=0.01)
-
-ax.set_title("Log-Returns avec régimes de volatilité détectés (triés)")
+ax.plot(data.index, data['Log_Returns'], color='black', lw=0.5, label="Log Returns")
+color_map = {0: 'green', 1: 'orange', 2: 'red'}
+for t, c in zip(data.index, data['Hidden_State'].map(color_map)):
+    ax.axvline(t, color=c, alpha=0.01)
+ax.set_title("Log Returns with HMM Regimes")
 plt.grid(True)
 plt.legend()
 plt.tight_layout()
 plt.show()
 
-# ✅ Durée moyenne par régime
-print("\nDurée moyenne par régime :")
+# =========================
+# 7) Average regime duration
+# =========================
+print("\nAverage duration per regime (days):")
 for i in range(3):
-    durations = data['Hidden_State'].eq(i).astype(int).groupby((data['Hidden_State'] != i).cumsum()).sum()
-    print(f"Régime {i} : {durations.mean():.2f} jours")
+    runs = data['Hidden_State'].eq(i).astype(int).groupby((data['Hidden_State'] != i).cumsum()).sum()
+    print(f"Regime {i}: {runs.mean():.2f}")
 
-# ✅ Matrice de transition
-# On réorganise les lignes/colonnes de la matrice pour correspondre au nouveau mapping
+# =========================
+# 8) Transition matrix (sorted)
+# =========================
 trans_mat_sorted = model.transmat_[sorted_states, :][:, sorted_states]
-trans_df = pd.DataFrame(trans_mat_sorted, columns=[f'Régime {i}' for i in range(3)], index=[f'Régime {i}' for i in range(3)])
+trans_df = pd.DataFrame(trans_mat_sorted, columns=[f'Regime {i}' for i in range(3)],
+                        index=[f'Regime {i}' for i in range(3)])
+plt.figure(figsize=(4, 3))
 sns.heatmap(trans_df, annot=True, cmap='Blues', fmt=".2f")
-plt.title("Matrice de transition du HMM (triée par volatilité)")
+plt.title("HMM Transition Matrix (sorted)")
+plt.tight_layout()
 plt.show()
-# Dernier état estimé
+
+# =========================
+# 9) One-step ahead regime probabilities
+# =========================
 last_state = hidden_states[-1]
-
-# Matrice de transition
-A = model.transmat_
-
-# Probabilité d'être dans chaque état demain
-proba_next = A[last_state]
-
-# Affichage
-print("\n Prévision pour demain :")
+proba_next = model.transmat_[last_state]
+print("\nOne-step regime forecast:")
 for i, p in enumerate(proba_next):
-    print(f"→ Probabilité d'être en Régime {i} : {p:.2%}")
+    print(f"→ P(Regime {i} tomorrow): {p:.2%}")
 
-# État le plus probable
-regime_prevu = np.argmax(proba_next)
-print(f"\n Régime le plus probable demain : Régime {regime_prevu}")
-
-import seaborn as sns
+regime_forecast = int(np.argmax(proba_next))
+print(f"\nMost likely tomorrow: Regime {regime_forecast}")
 
 plt.figure(figsize=(6, 4))
-sns.barplot(x=[f"Régime {i}" for i in range(3)], y=proba_next, palette=colors)
-plt.title("Probabilité de chaque régime demain")
+sns.barplot(x=[f"Regime {i}" for i in range(3)], y=proba_next, palette=colors)
+plt.title("Tomorrow's Regime Probabilities")
 plt.ylim(0, 1)
-plt.ylabel("Probabilité")
+plt.ylabel("Probability")
 plt.grid(True, axis='y')
 plt.tight_layout()
 plt.show()
-STATIC HMM
-# On prédit le régime du lendemain pour chaque jour
-predicted_next = []
 
+# =========================
+# 10) Strategy 1: long if next-regime=0 (state-0 long)
+# =========================
+pred_next = [np.nan]
 for t in range(len(hidden_states) - 1):
-    current_state = hidden_states[t]
-    probs = model.transmat_[current_state]
-    predicted_state = np.argmax(probs)
-    predicted_next.append(predicted_state)
+    s = hidden_states[t]
+    pred_next.append(np.argmax(model.transmat_[s]))
+data['Predicted_Regime'] = pred_next
 
-# Décalage pour aligner avec les returns de t+1
-predicted_next = [np.nan] + predicted_next  # Ajout d'un NaN pour que ça fasse la même longueur
-data['Predicted_Regime'] = predicted_next
+data['Strat_Ret_S0'] = data['Log_Returns'] * (data['Predicted_Regime'] == 0)
+data['Cum_Strat_S0'] = (1 + data['Strat_Ret_S0']).cumprod()
+data['Cum_Market'] = (1 + data['Log_Returns']).cumprod()
 
-# Stratégie : long uniquement si régime prédit = 0
-data['Strategy_Returns'] = data['Log_Returns'] * (data['Predicted_Regime'] == 0)
-
-# Cumul des rendements
-data['Cumulative_Strategy'] = (1 + data['Strategy_Returns']).cumprod()
-data['Cumulative_Market'] = (1 + data['Log_Returns']).cumprod()
-
-# 📊 Visualisation de la perf
 plt.figure(figsize=(14, 6))
-plt.plot(data.index, data['Cumulative_Market'], label='Buy & Hold (S&P500)', color='black', linestyle='--')
-plt.plot(data.index, data['Cumulative_Strategy'], label='Stratégie HMM (long si régime 0)', color='green')
-plt.title("Performance cumulée : HMM vs Buy & Hold")
-plt.ylabel("Capital (base 1)")
+plt.plot(data.index, data['Cum_Market'], label='Buy & Hold', color='black', linestyle='--')
+plt.plot(data.index, data['Cum_Strat_S0'], label='HMM Strategy (long if state 0)', color='green')
+plt.title("Cumulative Performance: HMM (state-0) vs Buy & Hold")
+plt.ylabel("Wealth (base=1)")
 plt.xlabel("Date")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-perf = data[['Strategy_Returns', 'Log_Returns']].dropna()
-mean_strategy = perf['Strategy_Returns'].mean() * 252
-mean_market = perf['Log_Returns'].mean() * 252
-vol_strategy = perf['Strategy_Returns'].std() * np.sqrt(252)
-vol_market = perf['Log_Returns'].std() * np.sqrt(252)
-sharpe_strategy = mean_strategy / vol_strategy
-sharpe_market = mean_market / vol_market
+perf = data[['Strat_Ret_S0', 'Log_Returns']].dropna()
+ann_mu_s0 = perf['Strat_Ret_S0'].mean() * 252
+ann_vol_s0 = perf['Strat_Ret_S0'].std() * np.sqrt(252)
+ann_mu_mkt = perf['Log_Returns'].mean() * 252
+ann_vol_mkt = perf['Log_Returns'].std() * np.sqrt(252)
+print("Annualized performance (state-0 strategy):")
+print(f"Strategy: Return={ann_mu_s0:.2%}, Vol={ann_vol_s0:.2%}, Sharpe={ann_mu_s0/ann_vol_s0:.2f}")
+print(f"Market  : Return={ann_mu_mkt:.2%}, Vol={ann_vol_mkt:.2%}, Sharpe={ann_mu_mkt/ann_vol_mkt:.2f}")
 
-print("📊 Résumé des performances annualisées :")
-print(f"Stratégie HMM : Rendement = {mean_strategy:.2%}, Volatilité = {vol_strategy:.2%}, Sharpe = {sharpe_strategy:.2f}")
-print(f"Buy & Hold     : Rendement = {mean_market:.2%}, Volatilité = {vol_market:.2%}, Sharpe = {sharpe_market:.2f}")
-# ✅ Prédiction du régime de demain pour chaque jour (multi-régime)
-predicted_next = []
+# =========================
+# 11) Strategy 2: multi-regime (+1, 0, −1)
+# =========================
+pos_map = {0: 1, 1: 0, 2: -1}
+data['Position_Multi'] = data['Predicted_Regime'].map(pos_map)
+data['Strat_Ret_Multi'] = data['Log_Returns'] * data['Position_Multi']
+data['Cum_Strat_Multi'] = (1 + data['Strat_Ret_Multi']).cumprod()
+data['Cum_BH'] = (1 + data['Log_Returns']).cumprod()
 
-for t in range(len(hidden_states) - 1):
-    current_state = hidden_states[t]
-    next_probs = model.transmat_[current_state]
-    next_state_pred = np.argmax(next_probs)
-    # Re-mappe selon l’ordre trié
-    next_state_remapped = remap[next_state_pred]
-    predicted_next.append(next_state_remapped)
-
-predicted_next = [np.nan] + predicted_next  # alignement temporel
-data['Predicted_Regime'] = predicted_next
-
-# ✅ Signal de position : +1 = long (régime 0), 0 = cash (régime 1), -1 = short (régime 2)
-position = data['Predicted_Regime'].map({0: 1, 1: 0, 2: -1})
-data['Position'] = position
-
-# ✅ Calcul des rendements de la stratégie
-data['Strategy_Multi'] = data['Log_Returns'] * data['Position']
-data['Cumulative_Multi'] = (1 + data['Strategy_Multi']).cumprod()
-data['Cumulative_BH'] = (1 + data['Log_Returns']).cumprod()
-
-# ✅ Visualisation de la perf
 plt.figure(figsize=(14, 6))
-plt.plot(data.index, data['Cumulative_BH'], label='Buy & Hold (S&P 500)', linestyle='--', color='gray')
-plt.plot(data.index, data['Cumulative_Multi'], label='Stratégie HMM multi-régime', color='purple')
-plt.title("Performance cumulée : stratégie multi-régime HMM vs Buy & Hold")
-plt.ylabel("Capital (base 1)")
+plt.plot(data.index, data['Cum_BH'], label='Buy & Hold', linestyle='--', color='gray')
+plt.plot(data.index, data['Cum_Strat_Multi'], label='HMM Multi-Regime', color='purple')
+plt.title("Cumulative Performance: HMM Multi-Regime vs Buy & Hold")
+plt.ylabel("Wealth (base=1)")
 plt.xlabel("Date")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
 plt.show()
 
-# ✅ Résumé des performances annualisées
-perf = data[['Strategy_Multi', 'Log_Returns']].dropna()
-
-mean_multi = perf['Strategy_Multi'].mean() * 252
-vol_multi = perf['Strategy_Multi'].std() * np.sqrt(252)
-sharpe_multi = mean_multi / vol_multi
-
-mean_bh = perf['Log_Returns'].mean() * 252
-vol_bh = perf['Log_Returns'].std() * np.sqrt(252)
-sharpe_bh = mean_bh / vol_bh
-
-print("\n📊 Performances annualisées :")
-print(f"Stratégie Multi-régime : Rendement = {mean_multi:.2%}, Volatilité = {vol_multi:.2f}, Sharpe = {sharpe_multi:.2f}")
-print(f"Buy & Hold             : Rendement = {mean_bh:.2%}, Volatilité = {vol_bh:.2f}, Sharpe = {sharpe_bh:.2f}")
-pip install streamlit yfinance hmmlearn matplotlib seaborn numpy pandas
-SV HMM STATIC
-# 📦 Imports
-import yfinance as yf
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-from sklearn.linear_model import LinearRegression
-import seaborn as sns
-
-# 📥 1. Données
-data = yf.download('^GSPC', start='2000-01-01', end='2025-04-01')
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-data.dropna(inplace=True)
-returns = data['Log_Returns'].values.reshape(-1, 1)
-
-# 🤖 2. HMM à 3 régimes + Viterbi
-model = GaussianHMM(n_components=3, covariance_type='full', n_iter=1000)
-model.fit(returns)
-viterbi_states = model.predict(returns)  # Viterbi path
-
-# 🔢 3. Trier les régimes par volatilité
-variances = [np.var(returns[viterbi_states == i]) for i in range(3)]
-sorted_states = np.argsort(variances)
-remap = {old: new for new, old in enumerate(sorted_states)}
-S_t = np.vectorize(remap.get)(viterbi_states)
-data['Regime'] = S_t
-
-# 📊 4. Préparer log(R²) pour estimer h_t
-data['Log_R2'] = np.log(data['Log_Returns'] ** 2 + 1e-8)
-
-# 🔁 5. Estimation AR(1) par régime
-params = {}
-h_t = np.zeros(len(data))
-
-for state in range(3):
-    idx = data['Regime'] == state
-    h_obs = data['Log_R2'][idx].values
-    h_lag = np.roll(h_obs, 1)
-    h_obs = h_obs[1:]
-    h_lag = h_lag[1:]
-
-    model_ar = LinearRegression()
-    model_ar.fit(h_lag.reshape(-1, 1), h_obs)
-    phi = model_ar.coef_[0]
-    mu = model_ar.intercept_ / (1 - phi)
-    resid = h_obs - model_ar.predict(h_lag.reshape(-1, 1))
-    sigma_eta = np.std(resid)
-
-    params[state] = {'mu': mu, 'phi': phi, 'sigma_eta': sigma_eta}
-
-    indices = np.where(data['Regime'] == state)[0]
-    h_t[indices[0]] = mu
-    for i in range(1, len(indices)):
-        t = indices[i]
-        t_prev = indices[i - 1]
-        if t == t_prev + 1:
-            h_t[t] = mu + phi * (h_t[t - 1] - mu)
-        else:
-            h_t[t] = mu
-
-# 🔢 6. Ajout de h_t et σ_t
-data['h_t'] = h_t
-data['Sigma_t'] = np.exp(h_t / 2)
-
-# 📈 7. Volatilité implicite
-plt.figure(figsize=(14, 5))
-plt.plot(data.index, data['Sigma_t'] * np.sqrt(252), label='Vol. implicite annualisée')
-plt.title("Volatilité implicite estimée (SV-HMM + Viterbi)")
-plt.xlabel("Date")
-plt.ylabel("Vol annualisée")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# 💼 8. Stratégie : long si régime 0, cash si 1, short si 2
-position = data['Regime'].map({0: 1, 1: 0, 2: -1})
-data['Strategy_SV'] = data['Log_Returns'] * position
-data['Cumulative_SV'] = (1 + data['Strategy_SV']).cumprod()
-data['Cumulative_BH'] = (1 + data['Log_Returns']).cumprod()
-
-# 📊 9. Visualisation de la performance
-plt.figure(figsize=(14, 6))
-plt.plot(data.index, data['Cumulative_BH'], label='Buy & Hold', linestyle='--', color='gray')
-plt.plot(data.index, data['Cumulative_SV'], label='Stratégie SV-HMM + Viterbi', color='purple')
-plt.title("Performance cumulée : stratégie SV-HMM (Viterbi) vs marché")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
-
-# 📈 10. Performances
-perf = data[['Strategy_SV', 'Log_Returns']].dropna()
-mean_sv = perf['Strategy_SV'].mean() * 252
-vol_sv = perf['Strategy_SV'].std() * np.sqrt(252)
-sharpe_sv = mean_sv / vol_sv
-
-mean_bh = perf['Log_Returns'].mean() * 252
-vol_bh = perf['Log_Returns'].std() * np.sqrt(252)
-sharpe_bh = mean_bh / vol_bh
-
-print("📊 Performances annualisées :")
-print(f"Stratégie SV-HMM : Rendement = {mean_sv:.2%}, Vol = {vol_sv:.2f}, Sharpe = {sharpe_sv:.2f}")
-print(f"Buy & Hold      : Rendement = {mean_bh:.2%}, Vol = {vol_bh:.2f}, Sharpe = {sharpe_bh:.2f}")
-
-# 📊 11. Matrice de transition triée
-mat_sorted = model.transmat_[sorted_states][:, sorted_states]
-plt.figure(figsize=(4, 3))
-sns.heatmap(mat_sorted, annot=True, cmap='Blues', fmt=".2f",
-            xticklabels=[f"Régime {i}" for i in range(3)],
-            yticklabels=[f"Régime {i}" for i in range(3)])
-plt.title("🔁 Matrice de transition (triée)")
-plt.tight_layout()
-plt.show()
-
-# 📊 12. Durée moyenne par régime
-print("\n⏱️ Durée moyenne par régime :")
-for i in range(3):
-    durations = data['Regime'].eq(i).astype(int).groupby((data['Regime'] != i).cumsum()).sum()
-    print(f"Régime {i} : {durations.mean():.2f} jours")
-
-# 📊 13. Statistiques par régime
-print("\n📊 Statistiques par régime (log-returns) :")
-for i in range(3):
-    sub = data[data['Regime'] == i]
-    mean = sub['Log_Returns'].mean()
-    var = sub['Log_Returns'].var()
-    ann_vol = np.sqrt(var) * np.sqrt(252)
-    print(f"Régime {i} : Moyenne = {mean:.5f}, Variance = {var:.5f}, Vol. annualisée = {ann_vol:.2%}")
-
-# 🎨 14. Visualisation des régimes
-colors_map = {0: 'green', 1: 'orange', 2: 'red'}
-plt.figure(figsize=(14, 6))
-for i in range(3):
-    mask = data['Regime'] == i
-    plt.plot(data.index[mask], data['Log_Returns'][mask], '.', label=f"Régime {i}", color=colors_map[i], alpha=0.5)
-
-plt.title("Régimes de marché détectés par SV-HMM (Viterbi)")
-plt.xlabel("Date")
-plt.ylabel("Log-returns")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
-from hmmlearn.hmm import GaussianHMM
-from tqdm import tqdm
-
-# Paramètres
-rolling_window = 1000
-refit_every = 10
-positions = []
-dates = []
-returns_strategy = []
-
-model_roll = None
-viterbi_states = None
-last_transmat = None
-last_state = None
-remap = None
-
-# 📊 Boucle principale
-loop_range = range(rolling_window, len(data) - 1)
-for t in tqdm(loop_range, desc="⏳ HMM semi-séquentiel à 3 régimes"):
-    window_returns = returns[t - rolling_window:t]
-
-    if (t - rolling_window) % refit_every == 0:
-        try:
-            if np.var(window_returns) < 1e-7:
-                continue
-
-            model_roll = GaussianHMM(n_components=3, covariance_type='full', n_iter=100)
-            model_roll.fit(window_returns)
-            viterbi_states = model_roll.predict(window_returns)
-
-            vols = [np.var(window_returns[viterbi_states == i]) for i in range(3)]
-            order = np.argsort(vols)
-            remap = {old: new for new, old in enumerate(order)}
-            viterbi_states = np.vectorize(remap.get)(viterbi_states)
-
-            last_state = viterbi_states[-1]
-            last_transmat = model_roll.transmat_[order][:, order]
-
-        except:
-            continue
-
-    if model_roll is None or last_transmat is None:
-        continue
-
-    # 🔮 Prédiction du régime de demain
-    proba_next = last_transmat[last_state]
-    pred_next_state = np.argmax(proba_next)
-    last_state = pred_next_state
-
-    # ✅ Stratégie : long = 0, cash = 1, short = 2
-    pos = {0: 1, 1: 0, 2: -1}[pred_next_state]
-    r_tomorrow = data['Log_Returns'].iloc[t + 1]
-
-    positions.append(pos)
-    dates.append(data.index[t + 1])
-    returns_strategy.append(pos * r_tomorrow)
-
-# 📊 Résultats
-df_seq3 = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy
-}).set_index('Date')
-
-df_seq3['Cumulative_Strategy'] = (1 + df_seq3['Return_Strategy']).cumprod()
-df_seq3['Cumulative_Market'] = (1 + data['Log_Returns'].loc[df_seq3.index]).cumprod()
-
-# 📈 Courbe de performance
-plt.figure(figsize=(14, 6))
-plt.plot(df_seq3.index, df_seq3['Cumulative_Market'], label='Buy & Hold', linestyle='--', color='gray')
-plt.plot(df_seq3.index, df_seq3['Cumulative_Strategy'], label='Stratégie HMM semi-séquentielle (3 régimes)', color='darkblue')
-plt.title("Performance cumulée : stratégie HMM semi-séquentielle (3 régimes)")
-plt.ylabel("Capital (base 1)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# 📊 Statistiques
-mean_seq3 = df_seq3['Return_Strategy'].mean() * 252
-vol_seq3 = df_seq3['Return_Strategy'].std() * np.sqrt(252)
-sharpe_seq3 = mean_seq3 / vol_seq3
-
-print("\n📊 Performance HMM semi-séquentielle (3 régimes) :")
-print(f"Rendement annualisé = {mean_seq3:.2%}")
-print(f"Volatilité annualisée = {vol_seq3:.2%}")
-print(f"Sharpe ratio = {sharpe_seq3:.2f}")
-HMM basic Static
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-from tqdm import tqdm
-import yfinance as yf
-
-# 📥 Données
-data = yf.download('^GSPC', start='2000-01-01', end='2025-04-01')
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-data.dropna(inplace=True)
-returns = data['Log_Returns'].values.reshape(-1, 1)
-
-# ⚙️ Paramètres
-rolling_window = 500
-refit_every = 5
-positions = []
-dates = []
-returns_strategy = []
-panic_flags = []
-
-model_roll = None
-viterbi_states = None
-last_transmat = None
-last_state = None
-remap = None
-
-# 🔐 Panic mode
-panic_mode = False
-panic_timer = 0
-
-loop_range = range(rolling_window, len(data) - 1)
-for t in tqdm(loop_range, desc="🚨 HMM 4 régimes + Real Panic Mode"):
-
-    window_returns = returns[t - rolling_window:t]
-
-    if (t - rolling_window) % refit_every == 0:
-        try:
-            model_roll = GaussianHMM(n_components=4, covariance_type='full', n_iter=1000)
-            model_roll.fit(window_returns)
-            viterbi_states = model_roll.predict(window_returns)
-
-            vols = [np.var(window_returns[viterbi_states == i]) for i in range(4)]
-            order = np.argsort(vols)
-            remap = {old: new for new, old in enumerate(order)}
-            viterbi_states = np.vectorize(remap.get)(viterbi_states)
-
-            last_state = viterbi_states[-1]
-            last_transmat = model_roll.transmat_[order][:, order]
-
-        except:
-            continue
-
-    if model_roll is None or last_transmat is None:
-        continue
-
-    # 📉 Stats marché récents
-    rolling_vol = np.std(returns[t-20:t]) * np.sqrt(252)
-    recent_return = np.mean(returns[t-5:t])
-
-    # 🔥 1. Panic Mode déclenchement
-    if not panic_mode and rolling_vol > 0.6 and recent_return < -0.01:
-        panic_mode = True
-        panic_timer = 30
-        print(f"🛑 Panic mode ACTIVÉ le {data.index[t]}")
-
-    # 🔓 2. Panic Mode désactivation
-    elif panic_mode:
-        if (rolling_vol < 0.3 and recent_return > 0) or panic_timer <= 0:
-            panic_mode = False
-            print(f"✅ Panic mode DÉSACTIVÉ le {data.index[t]}")
-        else:
-            panic_timer -= 1
-
-    # 📈 3. Allocation
-    if panic_mode:
-        pos = 0  # 🛑 LOCK
-        panic_flags.append(1)
-    else:
-        proba_next = last_transmat[last_state]
-        pos = proba_next[0]*1 + proba_next[1]*0.5 + proba_next[2]*(-0.5) + proba_next[3]*(-1)
-        last_state = np.argmax(proba_next)
-        panic_flags.append(0)
-
-    r_tomorrow = data['Log_Returns'].iloc[t + 1]
-    positions.append(pos)
-    dates.append(data.index[t + 1])
-    returns_strategy.append(pos * r_tomorrow)
-
-# 📊 Résultats
-df_panic = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy,
-    'Panic_Mode': panic_flags
-}).set_index('Date')
-
-df_panic['Cumulative_Strategy'] = (1 + df_panic['Return_Strategy']).cumprod()
-df_panic['Cumulative_Market'] = (1 + data['Log_Returns'].loc[df_panic.index]).cumprod()
-
-# 📈 Graphe perf + panic zones
-plt.figure(figsize=(14, 6))
-plt.plot(df_panic.index, df_panic['Cumulative_Market'], label='Buy & Hold', linestyle='--', color='gray')
-plt.plot(df_panic.index, df_panic['Cumulative_Strategy'], label='Stratégie HMM pondérée + Panic Mode', color='darkred')
-
-# Barres rouges pour panic
-for i in range(len(df_panic)):
-    if df_panic['Panic_Mode'].iloc[i] == 1:
-        plt.axvline(df_panic.index[i], color='red', alpha=0.02)
-
-plt.title("Performance stratégie HMM pondérée à 4 régimes + Panic Mode")
-plt.ylabel("Capital (base 1)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# 📊 Statistiques
-mean = df_panic['Return_Strategy'].mean() * 252
-vol = df_panic['Return_Strategy'].std() * np.sqrt(252)
-
-print("\n📊 Résultats finaux :")
-print(f"Rendement annualisé : {mean:.2%}")
-print(f"Volatilité annualisée : {vol:.2%}")
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-import yfinance as yf
-
-# 📥 Données
-data = yf.download('^GSPC', start='2000-01-01', end='2025-04-01')
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-data.dropna(inplace=True)
-returns = data['Log_Returns'].values.reshape(-1, 1)
-
-# 🔁 Comparaison pour différents nombres d'états
-log_likelihoods = []
-aics = []
-bics = []
+perf2 = data[['Strat_Ret_Multi', 'Log_Returns']].dropna()
+ann_mu_multi = perf2['Strat_Ret_Multi'].mean() * 252
+ann_vol_multi = perf2['Strat_Ret_Multi'].std() * np.sqrt(252)
+ann_mu_bh = perf2['Log_Returns'].mean() * 252
+ann_vol_bh = perf2['Log_Returns'].std() * np.sqrt(252)
+print("\nAnnualized performance (multi-regime):")
+print(f"Multi : Return={ann_mu_multi:.2%}, Vol={ann_vol_multi:.2%}, Sharpe={ann_mu_multi/ann_vol_multi:.2f}")
+print(f"Buy&H : Return={ann_mu_bh:.2%}, Vol={ann_vol_bh:.2%}, Sharpe={ann_mu_bh/ann_vol_bh:.2f}")
+
+# =========================
+# 12) Model order check (AIC/BIC across K)
+# =========================
 K_range = range(1, 6)
+loglikes, aics, bics = [], [], []
 n_obs = len(returns)
 
 for k in K_range:
     try:
-        model = GaussianHMM(n_components=k, covariance_type='full', n_iter=1000, random_state=42)
-        model.fit(returns)
-        log_likelihood = model.score(returns)
-
-        # ⚙️ Nombre de paramètres :
-        # (k-1) pour startprob, k(k-1) pour transmat, k pour variances, k pour moyennes
-        n_params = (k - 1) + (k * (k - 1)) + k + k
-
-        aic = -2 * log_likelihood + 2 * n_params
-        bic = -2 * log_likelihood + n_params * np.log(n_obs)
-
-        log_likelihoods.append(log_likelihood)
-        aics.append(aic)
-        bics.append(bic)
-
+        m = GaussianHMM(n_components=k, covariance_type='full', n_iter=1000, random_state=42)
+        m.fit(returns)
+        ll = m.score(returns)
+        # parameter count (approx, for univariate returns)
+        n_params = (k - 1) + (k * (k - 1)) + k + k  # startprob + transmat + var + mean
+        aic = -2 * ll + 2 * n_params
+        bic = -2 * ll + n_params * np.log(n_obs)
     except Exception as e:
-        print(f"Erreur pour {k} états : {e}")
-        log_likelihoods.append(np.nan)
-        aics.append(np.nan)
-        bics.append(np.nan)
+        ll, aic, bic = np.nan, np.nan, np.nan
+    loglikes.append(ll); aics.append(aic); bics.append(bic)
 
-# 📈 Graphe comparatif
-# 📊 Replot en 2 graphes pour meilleure lisibilité
 fig, ax = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
-
-# Graph 1 : log-vraisemblance
-ax[0].plot(K_range, log_likelihoods, marker='o', color='blue')
-ax[0].set_title("Log-vraisemblance selon le nombre d'états")
-ax[0].set_ylabel("Log-likelihood")
+ax[0].plot(K_range, loglikes, marker='o')
+ax[0].set_title("Log-Likelihood vs #States"); ax[0].set_ylabel("Log-L")
 ax[0].grid(True)
+ax[1].plot(K_range, aics, marker='s', label='AIC')
+ax[1].plot(K_range, bics, marker='^', label='BIC')
+ax[1].set_title("AIC / BIC vs #States"); ax[1].set_xlabel("#States"); ax[1].set_ylabel("Score")
+ax[1].legend(); ax[1].grid(True)
+plt.tight_layout(); plt.show()
 
-# Graph 2 : AIC / BIC
-ax[1].plot(K_range, aics, marker='s', label='AIC', color='orange')
-ax[1].plot(K_range, bics, marker='^', label='BIC', color='green')
-ax[1].set_title("AIC et BIC selon le nombre d'états")
-ax[1].set_xlabel("Nombre d'états")
-ax[1].set_ylabel("Score")
-ax[1].legend()
-ax[1].grid(True)
+best_k_bic = K_range[int(np.nanargmin(bics))]
+print(f"\nBIC-optimal number of states: {best_k_bic}")
 
-plt.tight_layout()
-plt.show()
-
-# ✅ Meilleur modèle selon BIC
-best_k = K_range[np.nanargmin(bics)]
-print(f"\n✅ Nombre optimal d'états selon le BIC : {best_k}")
-# Paramètres à tester
-window_sizes = [250, 500, 750, 1000, 1250]
-sharpe_scores = []
-
-for rw in tqdm(window_sizes, desc="🔍 Optimisation de la fenêtre"):
-
-    model = None
-    positions = []
-    returns_strategy = []
-    last_transmat = None
-    last_state = None
-
-    for t in range(rw, len(returns) - 1):
-        window_returns = returns[t - rw:t]
-
-        # Réestimation tous les 20 jours
-        if (t - rw) % 20 == 0:
-            try:
-                model = GaussianHMM(n_components=3, covariance_type='full', n_iter=100)
-                model.fit(window_returns)
-                viterbi = model.predict(window_returns)
-                vols = [np.var(window_returns[viterbi == i]) for i in range(3)]
-                order = np.argsort(vols)
-                last_transmat = model.transmat_[order][:, order]
-                last_state = order.tolist().index(viterbi[-1])
-            except:
-                continue
-
-        if model is None or last_transmat is None:
-            continue
-
-        # Prédiction du régime de demain
-        p_next = last_transmat[last_state]
-        pos = p_next[0]*1 + p_next[1]*0 + p_next[2]*(-1)
-        last_state = np.argmax(p_next)
-
-        r_tomorrow = data['Log_Returns'].iloc[t + 1]
-        returns_strategy.append(pos * r_tomorrow)
-        positions.append(pos)
-
-    # Calcul du Sharpe
-    strat = pd.Series(returns_strategy)
-    sharpe = strat.mean() * 252 / (strat.std() * np.sqrt(252))
-    sharpe_scores.append(sharpe)
-
-# 🔍 Résultats
-df_opt = pd.DataFrame({'Rolling_Window': window_sizes, 'Sharpe': sharpe_scores})
-
-plt.figure(figsize=(10, 5))
-plt.plot(df_opt['Rolling_Window'], df_opt['Sharpe'], marker='o')
-plt.title("Sharpe ratio en fonction de la taille de la fenêtre")
-plt.xlabel("Taille de la rolling window (jours)")
-plt.ylabel("Sharpe ratio annualisé")
-plt.grid(True)
-plt.tight_layout()
-plt.show()
-
-best_rw = df_opt.loc[df_opt['Sharpe'].idxmax(), 'Rolling_Window']
-print(f"🏆 Meilleure taille de rolling window : {int(best_rw)} jours")
-HMM test Static
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-from tqdm import tqdm
-import yfinance as yf
-
-# 📥 Données
-data = yf.download('^GSPC', start='2000-01-01', end='2025-04-01')
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-data.dropna(inplace=True)
-returns = data['Log_Returns'].values.reshape(-1, 1)
-
-# ⚙️ Paramètres
+# =========================
+# 13) Rolling HMM (semi-sequential) with simple Panic Mode (4 states)
+# =========================
 rolling_window = 500
-refit_every = 3
+refit_every = 5
+positions, dates, ret_strat, panic_flags = [], [], [], []
+
+model_roll = None
+last_transmat = None
+last_state = None
 n_states = 4
 
-positions = []
-dates = []
-returns_strategy = []
-panic_flags = []
-
-model = None
-remap = None
-last_state = None
-last_transmat = None
-
-# Panic mode
 panic_mode = False
 panic_timer = 0
 
-# 🔁 Boucle principale
-for t in tqdm(range(rolling_window, len(returns) - 1), desc="📊 HMM 4 régimes + Panic Mode"):
-
-    window_returns = returns[t - rolling_window:t]
+for t in tqdm(range(rolling_window, len(data) - 1), desc="Rolling HMM 4-state + Panic"):
+    window_ret = returns[t - rolling_window:t]
 
     if (t - rolling_window) % refit_every == 0:
         try:
-            model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=100)
-            model.fit(window_returns)
-
-            if np.any(model.transmat_.sum(axis=1) == 0):
+            if np.var(window_ret) < 1e-7:
                 continue
-
-            viterbi = model.predict(window_returns)
-            vols = [np.var(window_returns[viterbi == i]) for i in range(n_states)]
+            model_roll = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=300, random_state=42)
+            model_roll.fit(window_ret)
+            viterbi = model_roll.predict(window_ret)
+            vols = [np.var(window_ret[viterbi == i]) for i in range(n_states)]
             order = np.argsort(vols)
-            remap = {old: new for new, old in enumerate(order)}
-            last_state = remap[viterbi[-1]]
-            last_transmat = model.transmat_[order][:, order]
+            last_state = order.tolist().index(viterbi[-1])
+            last_transmat = model_roll.transmat_[order][:, order]
         except:
             continue
 
-    if model is None or last_transmat is None:
+    if model_roll is None or last_transmat is None:
         continue
 
-    # 🔍 Analyse marché récente
-    rolling_vol = np.std(returns[t-20:t]) * np.sqrt(252)
-    recent_return = np.mean(returns[t-5:t])
+    # simple risk trigger
+    rolling_vol = np.std(returns[t - 20:t]) * np.sqrt(252)
+    recent_ret = np.mean(returns[t - 5:t])
 
-    # 🔥 Panic Mode déclenchement
-    if not panic_mode and rolling_vol > 0.6 and recent_return < -0.01:
-        panic_mode = True
-        panic_timer = 30
-        print(f"🛑 Panic mode ACTIVÉ le {data.index[t]}")
-
-    # 🔓 Désactivation
+    if not panic_mode and (rolling_vol > 0.6 and recent_ret < -0.01):
+        panic_mode = True; panic_timer = 30
     elif panic_mode:
-        if (rolling_vol < 0.3 and recent_return > 0) or panic_timer <= 0:
+        if (rolling_vol < 0.3 and recent_ret > 0) or panic_timer <= 0:
             panic_mode = False
-            print(f"✅ Panic mode DÉSACTIVÉ le {data.index[t]}")
         else:
             panic_timer -= 1
 
-    # ⚖️ Position
     if panic_mode:
-        pos = 0  # 🛑 full cash
+        pos = 0.0
         panic_flags.append(1)
     else:
-        proba_next = last_transmat[last_state]
-        pos = proba_next[0]*1 + proba_next[1]*0.5 + proba_next[2]*(-0.5) + proba_next[3]*(-1)
-        last_state = np.argmax(proba_next)
+        p_next = last_transmat[last_state]
+        pos = p_next[0]*1 + p_next[1]*0.5 + p_next[2]*(-0.5) + p_next[3]*(-1)
+        last_state = int(np.argmax(p_next))
         panic_flags.append(0)
 
-    r_tomorrow = data['Log_Returns'].iloc[t + 1]
-    returns_strategy.append(pos * r_tomorrow)
-    positions.append(pos)
-    dates.append(data.index[t + 1])
+    r_next = data['Log_Returns'].iloc[t + 1]
+    positions.append(pos); dates.append(data.index[t + 1]); ret_strat.append(pos * r_next)
 
-# 📊 Résultats
-df = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy,
-    'Panic_Mode': panic_flags
-}).set_index('Date')
+df_roll = pd.DataFrame({'Date': dates, 'Position': positions,
+                        'Return_Strategy': ret_strat, 'Panic': panic_flags}).set_index('Date')
+df_roll['Cum_Strategy'] = (1 + df_roll['Return_Strategy']).cumprod()
+df_roll['Cum_Market'] = (1 + data['Log_Returns'].loc[df_roll.index]).cumprod()
 
-df['Cumulative_Strategy'] = (1 + df['Return_Strategy']).cumprod()
-df['Cumulative_Market'] = (1 + data['Log_Returns'].loc[df.index]).cumprod()
-
-# 📈 Graphe de perf + panic zone
 plt.figure(figsize=(14, 6))
-plt.plot(df.index, df['Cumulative_Market'], linestyle='--', color='gray', label='Buy & Hold')
-plt.plot(df.index, df['Cumulative_Strategy'], color='brown', label='Stratégie HMM pondérée + Panic Mode')
+plt.plot(df_roll.index, df_roll['Cum_Market'], '--', color='gray', label='Buy & Hold')
+plt.plot(df_roll.index, df_roll['Cum_Strategy'], color='darkred', label='HMM (4-state) + Panic')
+for d, f in zip(df_roll.index, df_roll['Panic']):
+    if f == 1:
+        plt.axvline(d, color='red', alpha=0.02)
+plt.title("Rolling HMM (4 states) with Panic Mode")
+plt.ylabel("Wealth (base=1)")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
 
-for i in range(len(df)):
-    if df['Panic_Mode'].iloc[i] == 1:
-        plt.axvline(df.index[i], color='red', alpha=0.02)
+ann_mu = df_roll['Return_Strategy'].mean() * 252
+ann_vol = df_roll['Return_Strategy'].std() * np.sqrt(252)
+print("\nRolling HMM (4-state) + Panic — Annualized:")
+print(f"Return={ann_mu:.2%}  Vol={ann_vol:.2%}  Sharpe={ann_mu/ann_vol if ann_vol>0 else np.nan:.2f}")
 
-plt.title("Stratégie HMM pondérée (4 régimes) + Panic Mode")
-plt.ylabel("Capital (base 1)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
+# =========================
+# 14) MA100 benchmark (BTC example)
+# =========================
+btc = yf.download('BTC-USD', start='2014-01-01', end='2025-01-01')
+btc['Log_Returns'] = np.log(btc['Close'] / btc['Close'].shift(1))
+btc['MA100'] = btc['Close'].rolling(100).mean()
+btc.dropna(inplace=True)
 
-# 📊 Statistiques finales
-mean = df['Return_Strategy'].mean() * 252
-vol = df['Return_Strategy'].std() * np.sqrt(252)
+pos, dates_b, ret = [], [], []
+for t in range(len(btc) - 1):
+    position = 1 if float(btc['Close'].iloc[t]) > float(btc['MA100'].iloc[t]) else -1
+    r_next = btc['Log_Returns'].iloc[t + 1]
+    pos.append(position); dates_b.append(btc.index[t + 1]); ret.append(position * r_next)
 
-print("\n📊 Résultats finaux :")
-print(f"Rendement annualisé : {mean:.2%}")
+df_ma = pd.DataFrame({'Date': dates_b, 'Position': pos, 'Return_Strategy': ret}).set_index('Date')
+df_ma['Cum_Strategy'] = (1 + df_ma['Return_Strategy']).cumprod()
+df_ma['Cum_Market'] = (1 + btc['Log_Returns'].loc[df_ma.index]).cumprod()
 
-print(f"Volatilité annualisée : {vol:.2f}")
-benchmark ma100
-import yfinance as yf
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+plt.figure(figsize=(14, 6))
+plt.plot(df_ma.index, df_ma['Cum_Market'], '--', label='Buy & Hold', color='gray')
+plt.plot(df_ma.index, df_ma['Cum_Strategy'], label='MA100 Strategy', color='red')
+plt.title("BTC: Buy & Hold vs MA100 Strategy")
+plt.ylabel("Wealth (base=1)")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
 
-# Télécharger les données BTC-USD (ou tout autre actif)
-data = yf.download('BTC-USD', start='2014-01-01', end='2025-01-01')
-# Calculer les log-returns
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-# Calculer la moyenne mobile sur 100 jours (MA100)
-data['MA100'] = data['Close'].rolling(100).mean()
-data.dropna(inplace=True)
+mu = df_ma['Return_Strategy'].mean() * 252
+sig = df_ma['Return_Strategy'].std() * np.sqrt(252)
+print("MA100 Strategy (BTC):")
+print(f"Return={mu:.2%}  Vol={sig:.2%}  Sharpe={mu/sig if sig>0 else np.nan:.2f}")
 
-# Générer le signal simple basé sur MA100
-positions = []
-dates = []
-returns_strategy = []
-
-for t in range(len(data) - 1):
-    # Forcer la conversion en float pour éviter l'ambiguïté
-    current_close = float(data['Close'].iloc[t])
-    current_MA100 = float(data['MA100'].iloc[t])
-    # Signal binaire simple : long si Close > MA100, sinon short
-    if current_close > current_MA100:
-        position = 1
-    else:
-        position = -1
-    # Appliquer la position au retour du lendemain
-    r_tomorrow = data['Log_Returns'].iloc[t + 1]
-    positions.append(position)
-    dates.append(data.index[t + 1])
-    returns_strategy.append(position * r_tomorrow)
-
-# Construire le DataFrame des résultats
-df = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy
-}).set_index('Date')
-
-df['Cumulative_Strategy'] = (1 + df['Return_Strategy']).cumprod()
-df['Cumulative_Market'] = (1 + data['Log_Returns'].loc[df.index]).cumprod()
-
-# Graphique comparatif
-plt.figure(figsize=(14,6))
-plt.plot(df.index, df['Cumulative_Market'], '--', label='Buy & Hold', color='gray')
-plt.plot(df.index, df['Cumulative_Strategy'], label='MA100 Strategy', color='red')
-plt.title("Performance : Buy & Hold vs MA100 Strategy")
-plt.ylabel("Capital cumulé (base 1)")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# Calcul des statistiques de performance
-mean = df['Return_Strategy'].mean() * 252
-vol = df['Return_Strategy'].std() * np.sqrt(252)
-sharpe = mean / vol
-
-print("Performance MA100 Strategy :")
-print(f"Rendement annualisé = {mean:.2%}")
-print(f"Volatilité annualisée = {vol:.2%}")
-print(f"Sharpe Ratio = {sharpe:.2f}")
-HMM V1
-import yfinance as yf
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-from tqdm import tqdm
-
-# 1. Télécharger les données du SP500 (ici '^GSPC')
-data = yf.download('ETH-USD', start='2014-01-01', end='2025-01-01')
-# Utilisation du "Close" pour ce code
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-# Calcul de la MA100 pour le filtre de tendance (MA100)
-data['MA100'] = data['Close'].rolling(100).mean()
-data.dropna(inplace=True)
-log_returns = data['Log_Returns'].values
-
-# 2. Paramètres du rolling
-window = 300    # Fenêtre pour capter rapidement la dynamique
-refit_every = 10  # Réestimation plus fréquente
-positions, dates, returns_strategy = [], [], []
-regime_list = []
-
-for t in tqdm(range(window, len(data) - 1), desc="Rolling HMM Simple à 4 états"):
-    if (t - window) % refit_every != 0:
+# =========================
+# 15) SV-HMM style (static) — AR(1) on log(R^2) per regime
+# =========================
+# Reuse earlier 3-state static regimes
+data['Log_R2'] = np.log(data['Log_Returns']**2 + 1e-8)
+params = {}
+h_t = np.zeros(len(data))
+for s in range(3):
+    idx = data['Hidden_State'] == s
+    y = data.loc[idx, 'Log_R2'].values
+    if len(y) < 3:
         continue
+    x_lag = np.roll(y, 1)[1:]; y_fit = y[1:]
+    ar = LinearRegression().fit(x_lag.reshape(-1, 1), y_fit)
+    phi = ar.coef_[0]
+    mu = ar.intercept_/(1 - phi) if abs(phi) < 1 else np.mean(y)
+    params[s] = {'phi': phi, 'mu': mu}
 
-    window_returns = log_returns[t - window:t].reshape(-1, 1)
-    model = GaussianHMM(n_components=4, covariance_type='full', n_iter=300)
-    
-    try:
-        if np.var(window_returns) < 1e-8:
-            continue
-        model.fit(window_returns)
-        if not np.allclose(model.transmat_.sum(axis=1), 1):
-            continue
-        if not np.all(np.isfinite(model.covars_)):
-            continue
-    except:
-        continue
+    indices = np.where(idx)[0]
+    if len(indices) > 0:
+        h_t[indices[0]] = mu
+        for i in range(1, len(indices)):
+            t0 = indices[i]; t_prev = indices[i - 1]
+            h_t[t0] = mu + phi * (h_t[t_prev] - mu) if t0 == t_prev + 1 else mu
 
-    # Décodeur Viterbi pour obtenir la séquence d'états sur la fenêtre
-    viterbi_states = model.predict(window_returns)
-    
-    # Reclassification : trier les états selon leur volatilité via la trace des covariances 
-    # (on considère 0 = état le moins volatil et 3 = état le plus volatil)
-    if model.covars_.ndim == 3:
-        vols = [np.trace(model.covars_[i]) for i in range(4)]
-    else:
-        vols = model.covars_.flatten()
-    sorted_idx = np.argsort(vols)  
-    remap = {old: new for new, old in enumerate(sorted_idx)}
-    
-    # On récupère l'état du dernier jour de la fenêtre et on le reclasse
-    last_state_original = viterbi_states[-1]
-    last_state_reclassified = remap[last_state_original]
-    
-    # Définition du signal selon l'état reclassé :
-    # Nous définissons une échelle continue sur 4 états :
-    # état 0 (calme)   -> signal = +1
-    # état 1 (intermédiaire) -> signal = +0.5
-    # état 2 (intermédiaire) -> signal = -0.5
-    # état 3 (panique) -> signal = -1
-    if last_state_reclassified == 0:
-        signal = 1.0
-    elif last_state_reclassified == 1:
-        signal = 0.5
-    elif last_state_reclassified == 2:
-        signal = -0.5
-    elif last_state_reclassified == 3:
-        signal = -1.0
-    else:
-        signal = 0
+data['SV_h'] = h_t
+data['SV_Sigma'] = np.exp(h_t / 2)
 
-    # Filtre de tendance : si le prix actuel est inférieur ou égal à la MA100, on neutralise le signal
-    current_close = float(data['Close'].iloc[t])
-    current_MA100 = float(data['MA100'].iloc[t])
-    if current_close <= current_MA100:
-        signal = 0
+plt.figure(figsize=(14, 5))
+plt.plot(data.index, data['SV_Sigma'] * np.sqrt(252), label='SV-HMM (annualized)')
+plt.title("SV-HMM-style Implied Volatility (AR(1) per regime)")
+plt.xlabel("Date"); plt.ylabel("Volatility")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
 
-    r_tomorrow = log_returns[t + 1]
-    positions.append(signal)
-    dates.append(data.index[t + 1])
-    returns_strategy.append(signal * r_tomorrow)
-    regime_list.append(last_state_reclassified)
+# Simple tri-state trading rule using regimes (same as multi-regime earlier)
+# Already computed above; you can reuse Position_Multi or design a vol-scaled variant.
 
-# 3. Construction du DataFrame des résultats
-df = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy,
-    'Regime': regime_list
-}).set_index('Date')
-
-df['Cumulative_Strategy'] = (1 + df['Return_Strategy']).cumprod()
-df['Cumulative_Market'] = (1 + data['Log_Returns'].loc[df.index]).cumprod()
-
-# 4. Graphique comparatif avec affichage de la MA100
-fig, ax1 = plt.subplots(figsize=(14,6))
-ax1.plot(df.index, df['Cumulative_Market'], '--', label='Buy & Hold', color='gray')
-ax1.plot(df.index, df['Cumulative_Strategy'], label='HMM Simple Strategy à 4 états', color='red')
-ax1.set_ylabel("Capital cumulé (base 1)")
-ax1.grid(True)
-ax1.legend(loc='upper left')
-
-# Axe secondaire pour afficher la MA100
-ax2 = ax1.twinx()
-ax2.plot(data.index, data['MA100'], label='MA100', color='blue', alpha=0.4)
-ax2.set_ylabel("MA100")
-ax2.legend(loc='upper right')
-
-plt.title("Performance : Buy & Hold vs HMM Simple (4 états, avec MA100)")
-plt.tight_layout()
-plt.show()
-
-# 5. Statistiques finales
-mean_simple = df['Return_Strategy'].mean() * 252
-vol_simple = df['Return_Strategy'].std() * np.sqrt(252)
-sharpe_simple = mean_simple / vol_simple
-
-print("Performance HMM Simple à 4 états sur BTC-USD :")
-print(f"Rendement annualisé = {mean_simple:.2%}")
-print(f"Volatilité annualisée = {vol_simple:.2%}")
-print(f"Sharpe Ratio = {sharpe_simple:.2f}")
-V3
-import yfinance as yf
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-from tqdm import tqdm
-from sklearn.linear_model import LinearRegression
-
-# 1. Télécharger les données BTC-USD (Bitcoin)
-data = yf.download('CL=F', start='2004-01-01', end='2025-01-01')
-# Utilisation du "Close" pour ce code
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-# Calcul de la moyenne mobile sur 100 jours pour le filtre de tendance (MA100)
-data['MA100'] = data['Close'].rolling(100).mean()
-data.dropna(inplace=True)
-log_returns = data['Log_Returns'].values
-
-# 2. Paramètres du rolling
-window = 300    # Fenêtre plus courte pour capter rapidement la dynamique
-refit_every = 10  # Réestimation plus fréquente pour suivre les changements
-positions, dates, returns_strategy = [], [], []
-regimes_rolling = []
-
-# Boucle rolling sur les données
-for t in tqdm(range(window, len(data) - 1), desc="Rolling HMMSV sur BTC-USD"):
-    
-    if (t - window) % refit_every != 0:
-        continue
-    
-    window_returns = log_returns[t - window:t].reshape(-1, 1)
-    model = GaussianHMM(n_components=3, covariance_type='full', n_iter=300)
-    
-    try:
-        if np.var(window_returns) < 1e-8:
-            continue
-        model.fit(window_returns)
-        if not np.allclose(model.transmat_.sum(axis=1), 1):
-            continue
-        if not np.all(np.isfinite(model.covars_)):
-            continue
-    except:
-        continue
-
-    # Obtenir les probabilités d'état sur la fenêtre et retenir celle du dernier jour
-    proba = model.predict_proba(window_returns)
-    last_proba = proba[-1]
-    
-    # Reclasser dynamiquement les états en fonction de la volatilité (trace des covariances)
-    if model.covars_.ndim == 3:
-        vols = [np.trace(model.covars_[i]) for i in range(3)]
-    else:
-        vols = model.covars_.flatten()
-    sorted_idx = np.argsort(vols)  # On suppose : 0 = état de faible volatilité (calme), 2 = état de forte volatilité (panique)
-    remap = {old: new for new, old in enumerate(sorted_idx)}
-    reordered_proba = np.zeros(3)
-    for i in range(3):
-        reordered_proba[remap[i]] = last_proba[i]
-    
-    # -------------------------
-    # Ajout de la modélisation AR(1) pour une dynamique de volatilité (HMMSV)
-    #
-    # On estime pour chaque état i un AR(1) sur log(R²) dans la fenêtre.
-    # On utilise une condition sur la probabilité (par exemple, proba > 0.5) pour sélectionner les périodes appartenant à cet état.
-    log_r2 = np.log(window_returns.flatten()**2 + 1e-8)
-    sigma_states = np.zeros(3)
-    for i in range(3):
-        idx = np.where(proba[:, i] > 0.5)[0]
-        if len(idx) < 3:
-            sigma_states[i] = np.nan
-        else:
-            y_ar = log_r2[idx]
-            x_ar = np.roll(y_ar, 1)[1:]
-            y_ar_fit = y_ar[1:]
-            model_ar = LinearRegression().fit(x_ar.reshape(-1, 1), y_ar_fit)
-            phi = model_ar.coef_[0]
-            mu = model_ar.intercept_ / (1 - phi)
-            h_ar = np.zeros(len(idx))
-            h_ar[0] = mu
-            for j in range(1, len(idx)):
-                # Si les indices sont consécutifs, on propage via AR(1), sinon on réinitialise
-                if idx[j] == idx[j-1] + 1:
-                    h_ar[j] = mu + phi * (h_ar[j-1] - mu)
-                else:
-                    h_ar[j] = mu
-            sigma_states[i] = np.exp(h_ar[-1] / 2)  # Volatilité prévisionnelle pour cet état
-
-    # Calcul de la volatilité globale prévisionnelle comme moyenne pondérée des sigma_states,
-    # en utilisant les probabilités reclassées (si certaines valeurs sont NaN, on les ignore)
-    valid = ~np.isnan(sigma_states)
-    if np.sum(valid) > 0:
-        sigma_weighted = np.sum(reordered_proba[valid]*sigma_states[valid]) / np.sum(reordered_proba[valid])
-    else:
-        sigma_weighted = 0.02  # valeur par défaut
-
-    # -------------------------
-    # Filtre de tendance : comparer le Close et le MA100 (conversion en float)
-    current_close = float(data['Close'].iloc[t])
-    current_MA100 = float(data['MA100'].iloc[t])
-    if current_close > current_MA100:
-        # Tendance haussière : booster l'exposition long et atténuer le short
-        long_weight = 2.0
-        short_weight = -0.25
-    else:
-        # Tendance baissière : réduire l'exposition long et rester agressif short
-        long_weight = 0.75
-        short_weight = -1.0
-
-    # Signal issu du HMM de base (pondéré) :
-    hmm_signal = reordered_proba[0] * long_weight + reordered_proba[2] * short_weight
-    # Optionnellement, on peut moduler le signal en fonction de la volatilité prévisionnelle.
-    # Par exemple, si la volatilité prévisionnelle est trop élevée, réduire l'exposition.
-    threshold = 0.03  # Par exemple, 3% de volatilité journalier attendue
-    if sigma_weighted > threshold:
-        final_signal = hmm_signal * 0.5  # réduction de l'exposition si vol trop élevée
-    else:
-        final_signal = hmm_signal
-
-    # -------------------------
-    r_tomorrow = log_returns[t + 1]
-    positions.append(final_signal)
-    dates.append(data.index[t + 1])
-    returns_strategy.append(final_signal * r_tomorrow)
-    regimes_rolling.append(np.argmax(reordered_proba))
-
-# 3. Construction du DataFrame des résultats
-df = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy,
-    'Regime': regimes_rolling
-}).set_index('Date')
-
-df['Cumulative_Strategy'] = (1 + df['Return_Strategy']).cumprod()
-df['Cumulative_Market'] = (1 + data['Log_Returns'].loc[df.index]).cumprod()
-
-# 4. Graphique comparatif avec affichage de la MA100
-fig, ax1 = plt.subplots(figsize=(14,6))
-ax1.plot(df.index, df['Cumulative_Market'], '--', label='Buy & Hold', color='gray')
-ax1.plot(df.index, df['Cumulative_Strategy'], label='HMMSV optimisé', color='blue')
-ax1.set_ylabel("Capital cumulé (base 1)")
-ax1.grid(True)
-ax1.legend(loc='upper left')
-
-# Axe secondaire pour afficher la MA100
-ax2 = ax1.twinx()
-ax2.plot(data.index, data['MA100'], label='MA100', color='orange', alpha=0.5)
-ax2.set_ylabel("MA100")
-ax2.legend(loc='upper right')
-
-plt.title("Performance : Buy & Hold vs HMMSV sur BTC-USD (avec MA100)")
-plt.tight_layout()
-plt.show()
-
-# 5. Statistiques finales
-mean = df['Return_Strategy'].mean() * 252
-vol = df['Return_Strategy'].std() * np.sqrt(252)
-sharpe = mean / vol
-
-print("Approximate SV-HMM with rolling volatility-adjusted HMM probabilities and AR(1)-based volatility forecast")
-print(f"Rendement annualisé = {mean:.2%}")
-print(f"Volatilité annualisée = {vol:.2%}")
-print(f"Sharpe Ratio = {sharpe:.2f}")
-print(f"Volatilité prévisionnelle (moyenne pondérée) = {sigma_weighted:.4f}")
-V3 MODIF
-import yfinance as yf
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-from tqdm import tqdm
-
-# 1. Télécharger les données du SP500 (ici '^GSPC')
-data = yf.download('CL=F', start='2014-01-01', end='2025-01-01')
-# Utilisation du "Close" pour ce code
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-# Calcul de la MA100 pour le filtre de tendance (MA100)
-data['MA100'] = data['Close'].rolling(100).mean()
-data.dropna(inplace=True)
-log_returns = data['Log_Returns'].values
-
-# 2. Paramètres du rolling
-window = 300   # Fenêtre pour capter rapidement la dynamique
-refit_every = 10  # Réestimation plus fréquente
-positions, dates, returns_strategy, regime_list = [], [], [], []
-
-# Paramètres pour la modulation de volatilité
-vol_threshold = 0.03         # Seuil de volatilité attendu (exemple: 3% de volatilité journalière)
-modulation_factor = 0.5      # Facteur de réduction de signal si volatilité trop forte
-epsilon = 1e-8               # Petite constante pour éviter log(0)
-
-for t in tqdm(range(window, len(data)-1), desc="Rolling HMMSV avec filtre MA100"):
-    if (t - window) % refit_every != 0:
-        continue
-
-    # Extraction de la fenêtre d'observations
-    window_returns = log_returns[t-window:t].reshape(-1, 1)
-    
-    # Ajustement de l'HMM (ici avec 3 états)
-    model = GaussianHMM(n_components=3, covariance_type='full', n_iter=300)
-    try:
-        if np.var(window_returns) < 1e-8:
-            continue
-        model.fit(window_returns)
-        if not np.allclose(model.transmat_.sum(axis=1), 1):
-            continue
-        if not np.all(np.isfinite(model.covars_)):
-            continue
-    except:
-        continue
-    
-    # Extraction des probabilités d'appartenance via predict_proba
-    proba = model.predict_proba(window_returns)
-    last_proba = proba[-1]
-    
-    # Reclassification des états en fonction de la volatilité
-    if model.covars_.ndim == 3:
-        vols = [np.trace(model.covars_[i]) for i in range(3)]
-    else:
-        vols = model.covars_.flatten()
-    sorted_idx = np.argsort(vols)  # ordre croissant: 0 = état le moins volatil, 2 = état le plus volatil
-    remap = {old: new for new, old in enumerate(sorted_idx)}
-    reordered_proba = np.zeros(3)
-    for i in range(3):
-        reordered_proba[remap[i]] = last_proba[i]
-    
-    # Construction du signal de base à partir des probabilités
-    # On assume que :
-    # - l'état 0 correspond à un régime "calme" (signal haussier),
-    # - l'état 2 correspond à un régime "panique" (signal baissier),
-    # et on ignore l'état intermédiaire (signal pondéré par 0).
-    # Le choix des poids dépend de la tendance du marché observée.
-    current_close = float(data['Close'].iloc[t])
-    current_MA100 = float(data['MA100'].iloc[t])
-    if current_close > current_MA100:
-        w_long = 2.0
-        w_short = -0.25
-    else:
-        w_long = 0.75
-        w_short = -1.0
-    signal_base = reordered_proba[0]*w_long + reordered_proba[2]*w_short
-    
-    # Estimation dynamique de la volatilité par un modèle AR(1) sur log(r^2)
-    log_sq = np.log(window_returns**2 + epsilon)
-    # Construction des paires (lag 1) pour ajuster y_t = phi * y_{t-1} + c
-    X = log_sq[:-1].flatten()
-    Y = log_sq[1:].flatten()
-    try:
-        phi, c = np.polyfit(X, Y, 1)
-    except:
-        continue
-    h_last = log_sq[-1, 0]
-    sigma_forecast = np.exp(h_last/2)
-    
-    # Modulation du signal par la volatilité prévue
-    if sigma_forecast > vol_threshold:
-        signal_modulated = signal_base * modulation_factor
-    else:
-        signal_modulated = signal_base
-    
-    # Application du filtre MA100: si le prix actuel est inférieur ou égal à la MA100, 
-    # on neutralise le signal
-    if current_close <= current_MA100:
-        signal_final = 0
-    else:
-        signal_final = signal_modulated
-    
-    # Calcul du rendement du jour suivant et enregistrement du signal
-    r_tomorrow = log_returns[t+1]
-    positions.append(signal_final)
-    dates.append(data.index[t+1])
-    returns_strategy.append(signal_final * r_tomorrow)
-    regime_list.append(np.argmax(reordered_proba))
-
-# 3. Construction du DataFrame des résultats
-df = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy,
-    'Regime': regime_list
-}).set_index('Date')
-
-df['Cumulative_Strategy'] = (1 + df['Return_Strategy']).cumprod()
-df['Cumulative_Market'] = (1 + data['Log_Returns'].loc[df.index]).cumprod()
-
-# 4. Graphique comparatif avec affichage de la MA100
-fig, ax1 = plt.subplots(figsize=(14,6))
-ax1.plot(df.index, df['Cumulative_Market'], '--', label='Buy & Hold', color='gray')
-ax1.plot(df.index, df['Cumulative_Strategy'], label='HMMSV Optimisé avec MA100', color='blue')
-ax1.set_ylabel("Capital cumulé (base 1)")
-ax1.grid(True)
-ax1.legend(loc='upper left')
-
-ax2 = ax1.twinx()
-ax2.plot(data.index, data['MA100'], label='MA100', color='orange', alpha=0.5)
-ax2.set_ylabel("MA100")
-ax2.legend(loc='upper right')
-
-plt.title("Performance : Buy & Hold vs HMMSV Optimisé (avec MA100)")
-plt.tight_layout()
-plt.show()
-
-# 5. Statistiques finales
-mean_model3 = np.mean(df['Return_Strategy']) * 252
-vol_model3 = np.std(df['Return_Strategy']) * np.sqrt(252)
-sharpe_model3 = mean_model3 / vol_model3
-
-print("Performance HMMSV Optimisé avec MA100 sur BTC-USD :")
-print(f"Rendement annualisé = {mean_model3:.2%}")
-print(f"Volatilité annualisée = {vol_model3:.2%}")
-print(f"Sharpe Ratio = {sharpe_model3:.2f}")
-V2
-print("Shape du DataFrame :", data.shape)
-print(data.head())
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-from tqdm import tqdm
-
-# 1. Chargement des données depuis fichier local (Stooq)
-data = pd.read_csv("/Users/jeremy.duriez/Desktop/^spx_d.csv")
-data = data[::-1]
-data = data.rename(columns=str.strip)
-data['Date'] = pd.to_datetime(data['Date'])
-data.set_index('Date', inplace=True)
-data = data[data.index >= '2000-01-01']
-
-# 2. Calcul des log-returns et MA100
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-data['MA100'] = data['Close'].rolling(100).mean()
-data.dropna(inplace=True)
-log_returns = data['Log_Returns'].values
-
-# 3. Paramètres de la stratégie
-window = 1000
-refit_every = 30
-positions, dates, returns_strategy, regime_list = [], [], [], []
-
-for t in tqdm(range(window, len(data) - 1), desc="Rolling HMM Optimisé"):
-    if (t - window) % refit_every != 0:
-        continue
-
-    window_returns = log_returns[t - window:t].reshape(-1, 1)
-    model = GaussianHMM(n_components=4, covariance_type='full', n_iter=500)
-
-    try:
-        if np.var(window_returns) < 1e-8:
-            continue
-        model.fit(window_returns)
-        if not np.allclose(model.transmat_.sum(axis=1), 1):
-            continue
-        if not np.all(np.isfinite(model.covars_)):
-            continue
-    except:
-        continue
-
-    proba = model.predict_proba(window_returns)
-    last_proba = proba[-1]
-
-    # Reclassement des régimes selon la volatilité
-    if model.covars_.ndim == 3:
-        vols = [np.trace(model.covars_[i]) for i in range(4)]
-    else:
-        vols = model.covars_.flatten()
-    sorted_idx = np.argsort(vols)
-    remap = {old: new for new, old in enumerate(sorted_idx)}
-
-    reordered_proba = np.zeros(4)
-    for i in range(4):
-        reordered_proba[remap[i]] = last_proba[i]
-
-    # Signal pondéré par proba et régimes
-    signal_continuous = (
-        +1.0 * reordered_proba[0] +
-        +0.5 * reordered_proba[1] +
-        -0.5 * reordered_proba[2] +
-        -1.0 * reordered_proba[3]
-    )
-
-    # Ajustement selon la tendance (MA100)
-    current_close = float(data['Close'].iloc[t])
-    current_MA100 = float(data['MA100'].iloc[t])
-    if current_close > current_MA100:
-        signal_final = signal_continuous * 1.2
-    else:
-        signal_final = signal_continuous * 0.7
-
-    # Ajustement selon la volatilité récente (risk control)
-    recent_vol = np.std(log_returns[t - 20:t])
-    if recent_vol > 0.02:
-        signal_final *= 0.5
-
-    r_tomorrow = log_returns[t + 1]
-    positions.append(signal_final)
-    dates.append(data.index[t + 1])
-    returns_strategy.append(signal_final * r_tomorrow)
-    regime_list.append(np.argmax(reordered_proba))
-
-# 4. Résultats
-df = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy,
-    'Regime': regime_list
-}).set_index('Date')
-
-df['Cumulative_Strategy'] = (1 + df['Return_Strategy']).cumprod()
-df['Cumulative_Market'] = (1 + data['Log_Returns'].loc[df.index]).cumprod()
-
-# 5. Visualisation
-fig, ax1 = plt.subplots(figsize=(14,6))
-ax1.plot(df.index, df['Cumulative_Market'], '--', label='Buy & Hold (S&P 500)', color='gray')
-ax1.plot(df.index, df['Cumulative_Strategy'], label='HMM Optimisé (4 états)', color='red')
-ax1.set_ylabel("Capital cumulé (base 1)")
-ax1.grid(True)
-ax1.legend(loc='upper left')
-
-ax2 = ax1.twinx()
-ax2.plot(data.index, data['MA100'], label='MA100', color='blue', alpha=0.4)
-ax2.set_ylabel("MA100")
-ax2.legend(loc='upper right')
-
-plt.title("Performance : Buy & Hold vs HMM Optimisé (S&P 500, 4 états, MA100, scaling dynamique)")
-plt.tight_layout()
-plt.show()
-
-# 6. Statistiques
-mean = df['Return_Strategy'].mean() * 252
-vol = df['Return_Strategy'].std() * np.sqrt(252)
-sharpe = mean / vol
-drawdown = (df['Cumulative_Strategy'] / df['Cumulative_Strategy'].cummax() - 1).min()
-
-print("📊 Performance HMM Optimisé sur S&P 500 :")
-print(f"Rendement annualisé = {mean:.2%}")
-print(f"Volatilité annualisée = {vol:.2%}")
-print(f"Sharpe Ratio = {sharpe:.2f}")
-print(f"Max Drawdown = {drawdown:.2%}")
-SVHMM volatility forecast
-import yfinance as yf
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
-from tqdm import tqdm
-from sklearn.linear_model import LinearRegression
-
-# --- Step 0: reproducible jitter
+# =========================
+# 16) SV-HMM (rolling, with trend & vol scaling) — Example on AAPL
+# =========================
 rng = np.random.default_rng(42)
 jitter_scale = 1e-8
 
-# --- Step 1: Download data, compute returns & shifted MA100
-data = yf.download('AAPL', start='2004-01-01', end='2025-01-01')
-data['Log_Returns'] = np.log(data['Close'] / data['Close'].shift(1))
-data['MA100']       = data['Close'].shift(1).rolling(100).mean()
-data.dropna(inplace=True)
+aapl = yf.download('AAPL', start='2004-01-01', end='2025-01-01')
+aapl['Log_Returns'] = np.log(aapl['Close'] / aapl['Close'].shift(1))
+aapl['MA100']       = aapl['Close'].shift(1).rolling(100).mean()
+aapl.dropna(inplace=True)
+lr = aapl['Log_Returns'].values
 
-log_returns = data['Log_Returns'].values
+window = 300
+refit_every = 10
+tc = 0.001  # simple cost proxy
 
-# --- Step 2: Parameters
-window           = 300
-refit_every      = 10
-transaction_cost = 0.001   # 0.1% round‑trip cost
+pos, dts, pnl, reg = [], [], [], []
+cur_sig = 0.0; cur_reg = 1; cur_sigma = 0.0
 
-# Storage
-positions        = []
-dates            = []
-returns_strategy = []
-regimes_rolling  = []
-
-# State carried between refits
-current_signal   = 0.0
-current_regime   = 1
-current_sigma    = 0.0
-
-# --- Step 3: Rolling window, daily P&L
-for t in tqdm(range(window, len(data) - 1), desc="Rolling SV‑HMM"):
-    # only refit every refit_every days
+for t in tqdm(range(window, len(aapl) - 1), desc="Rolling SV-HMM (AAPL)"):
     if (t - window) % refit_every == 0:
-        window_ret = log_returns[t-window:t].reshape(-1,1)
-        if np.var(window_ret) < 1e-8:
-            # too little variance, skip
-            pass
-        else:
+        wr = lr[t - window:t].reshape(-1, 1)
+        if np.var(wr) >= 1e-8:
             try:
-                # add tiny noise to avoid degenerate covariances
-                wr = window_ret + rng.normal(0, jitter_scale, window_ret.shape)
+                wrj = wr + rng.normal(0, jitter_scale, wr.shape)
+                m = GaussianHMM(n_components=3, covariance_type='full', n_iter=300, random_state=42)
+                m.fit(wrj)
+                proba = m.predict_proba(wrj)
+                last_p = proba[-1]
+                vols = [np.trace(c) for c in m.covars_]
+                ord3 = np.argsort(vols)
+                p_ord = np.array([last_p[i] for i in ord3])
 
-                # fit HMM
-                model = GaussianHMM(n_components=3, covariance_type='full', n_iter=300)
-                model.fit(wr)
-
-                # posterior probs
-                proba      = model.predict_proba(wr)
-                last_proba = proba[-1]
-
-                # reorder by vol
-                vols       = [np.trace(cov) for cov in model.covars_]
-                order      = np.argsort(vols)
-                p_reord    = np.array([ last_proba[i] for i in order ])
-
-                # AR(1) on log‐sq‐returns to forecast sigma per state
-                lr2 = np.log(wr.flatten()**2 + 1e-8)
+                # AR(1) on log-sq-returns for per-state sigma forecast
+                lr2 = np.log(wrj.flatten()**2 + 1e-8)
                 sigma_states = np.zeros(3)
                 for i in range(3):
-                    idx = np.where(proba[:,i] > 0.5)[0]
+                    idx = np.where(proba[:, i] > 0.5)[0]
                     if len(idx) >= 5:
                         y  = lr2[idx]
                         x  = y[:-1]; y1 = y[1:]
-                        ar = LinearRegression().fit(x.reshape(-1,1), y1)
+                        ar = LinearRegression().fit(x.reshape(-1, 1), y1)
                         phi = ar.coef_[0]
                         if abs(phi) < 1:
-                            mu = ar.intercept_/(1-phi)
+                            mu = ar.intercept_/(1 - phi)
                             h  = mu + phi*(y1[-1] - mu)
                             sigma_states[i] = np.exp(h/2)
                         else:
@@ -1529,66 +425,38 @@ for t in tqdm(range(window, len(data) - 1), desc="Rolling SV‑HMM"):
                     else:
                         sigma_states[i] = np.nan
 
-                valid = ~np.isnan(sigma_states)
-                if valid.any():
-                    current_sigma = (p_reord[valid]*sigma_states[valid]).sum() / p_reord[valid].sum()
+                vmask = ~np.isnan(sigma_states)
+                if vmask.any():
+                    cur_sigma = (p_ord[vmask] * sigma_states[vmask]).sum() / p_ord[vmask].sum()
 
-                # trend filter via shifted MA100
-                price = float(data['Close'].iloc[t])
-                ma100 = float(data['MA100'].iloc[t])
-                if price > ma100:
-                    lw, sw = 2.0, -0.25
-                else:
-                    lw, sw = 0.75, -1.0
+                # trend filter
+                price = float(aapl['Close'].iloc[t]); ma100 = float(aapl['MA100'].iloc[t])
+                lw, sw = (2.0, -0.25) if price > ma100 else (0.75, -1.0)
 
-                # build signal
-                hmm_sig        = p_reord[0]*lw + p_reord[2]*sw
-                current_signal = 0.5*hmm_sig if current_sigma > 0.03 else hmm_sig
-                current_regime = int(np.argmax(p_reord))
-
+                hmm_sig = p_ord[0]*lw + p_ord[2]*sw
+                cur_sig = 0.5*hmm_sig if cur_sigma > 0.03 else hmm_sig
+                cur_reg = int(np.argmax(p_ord))
             except Exception as e:
-                print(f"[t={t} {data.index[t].date()}] HMM fit failed: {e}")
-                # keep prior current_signal/regime/sigma
+                # keep previous signal if refit fails
+                pass
 
-    # apply daily P&L
-    r_next = log_returns[t+1]
-    cost   = transaction_cost * abs(current_signal - (positions[-1] if positions else 0.0))
-    pnl    = current_signal * r_next - cost
+    r_next = lr[t + 1]
+    cost = tc * abs(cur_sig - (pos[-1] if pos else 0.0))
+    pnl_day = cur_sig * r_next - cost
 
-    positions.append(current_signal)
-    returns_strategy.append(pnl)
-    regimes_rolling.append(current_regime)
-    dates.append(data.index[t+1])
+    pos.append(cur_sig); pnl.append(pnl_day); reg.append(cur_reg); dts.append(aapl.index[t + 1])
 
-# --- Step 4: Build results
-df_hmm = pd.DataFrame({
-    'Date': dates,
-    'Position': positions,
-    'Return_Strategy': returns_strategy,
-    'Regime': regimes_rolling
-}).set_index('Date')
+df_sv = pd.DataFrame({'Date': dts, 'Position': pos, 'Return_Strategy': pnl, 'Regime': reg}).set_index('Date')
+df_sv['Cum_Strategy'] = (1 + df_sv['Return_Strategy']).cumprod()
+df_sv['Cum_Market']   = (1 + aapl['Log_Returns'].loc[df_sv.index]).cumprod()
 
-df_hmm['Cumulative_Strategy'] = (1 + df_hmm['Return_Strategy']).cumprod()
-df_hmm['Cumulative_Market']   = (1 + data['Log_Returns'].loc[df_hmm.index]).cumprod()
+plt.figure(figsize=(12, 6))
+plt.plot(df_sv.index, df_sv['Cum_Market'], '--', label='Buy & Hold')
+plt.plot(df_sv.index, df_sv['Cum_Strategy'], label='SV-HMM Strategy')
+plt.legend(); plt.title("SV-HMM Strategy vs Buy & Hold (AAPL)")
+plt.grid(True); plt.tight_layout(); plt.show()
 
-# --- Step 5: Metrics
-daily    = df_hmm['Return_Strategy']
-mean_ann = daily.mean() * 252
-vol_ann  = daily.std()  * np.sqrt(252)
-sharpe   = mean_ann / vol_ann
-
-print("SV‑HMM Approx. with daily P&L & costs")
-print(f"Annual Return    = {mean_ann:.2%}")
-print(f"Annual Volatility= {vol_ann:.2%}")
-print(f"Sharpe Ratio     = {sharpe:.2f}")
-print(f"Last σ forecast  = {current_sigma:.4f}")
-
-# --- Step 6: Plot
-plt.figure(figsize=(12,6))
-plt.plot(df_hmm.index, df_hmm['Cumulative_Market'],   '--', label='Buy & Hold')
-plt.plot(df_hmm.index, df_hmm['Cumulative_Strategy'],  label='SV‑HMM Strat')
-plt.legend(); plt.title("SV‑HMM Strategy vs. Buy & Hold")
-plt.grid(True); plt.tight_layout()
-plt.show()
- 
- 
+mu = df_sv['Return_Strategy'].mean() * 252
+vol = df_sv['Return_Strategy'].std() * np.sqrt(252)
+print("SV-HMM (rolling) — Annualized:")
+print(f"Return={mu:.2%}  Vol={vol:.2%}  Sharpe={mu/vol if vol>0 else np.nan:.2f}")
